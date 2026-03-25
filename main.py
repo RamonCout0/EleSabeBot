@@ -57,11 +57,26 @@ def db_init():
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
-        # Migração segura: adiciona coluna se já existia banco antigo sem ela
-        try:
-            c.execute("ALTER TABLE guild_config ADD COLUMN autorole_id INTEGER DEFAULT NULL")
-        except sqlite3.OperationalError:
-            pass  # Coluna já existe, tudo certo
+        # ── NOVO: Reaction Roles ──────────────────────────────────
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS reaction_roles (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                channel_id  INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                emoji       TEXT    NOT NULL,
+                role_id     INTEGER NOT NULL,
+                description TEXT    DEFAULT '',
+                bot_message INTEGER DEFAULT 1,
+                UNIQUE(message_id, emoji)
+            )
+        """)
+        # Migrações seguras
+        for col in ["autorole_id INTEGER DEFAULT NULL"]:
+            try:
+                c.execute(f"ALTER TABLE guild_config ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 def guild_config(guild_id: int) -> dict:
@@ -155,16 +170,6 @@ async def on_command_error(ctx, error):
 @bot.command(name="config")
 @commands.has_permissions(administrator=True)
 async def config_cmd(ctx, chave: str = None, *, valor: str = None):
-    """
-    .config                       → mostra config atual
-    .config tipo public/private   → tipo do servidor
-    .config categoria ADMIN       → nome da categoria admin
-    .config log_canal logs-gerais → nome do canal de logs
-    .config boas_vindas_canal #canal
-    .config boas_vindas_msg Bem-vindo {mention} ao {server}!
-    .config autorole @Cargo       → cargo automático ao entrar
-    .config autorole_remover      → desativa o autorole
-    """
     cfg = guild_config(ctx.guild.id)
 
     if not chave:
@@ -391,7 +396,6 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     cfg = guild_config(guild.id)
 
-    # Boas-vindas
     if cfg['welcome_channel_id']:
         channel = guild.get_channel(cfg['welcome_channel_id'])
         if channel:
@@ -404,16 +408,14 @@ async def on_member_join(member: discord.Member):
             embed.set_footer(text=f"Membro #{guild.member_count}")
             await channel.send(embed=embed)
 
-    # Autorole
     if cfg['autorole_id']:
         role = guild.get_role(cfg['autorole_id'])
         if role:
             try:
                 await member.add_roles(role, reason="Autorole automático")
             except discord.Forbidden:
-                pass  # Bot sem permissão ou cargo acima do bot na hierarquia
+                pass
 
-    # Log de entrada
     log_ch = await get_log_channel(guild)
     if log_ch:
         age = (datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
@@ -640,6 +642,409 @@ async def setup_ticket(ctx):
     await ctx.send(embed=embed, view=TicketView())
 
 # ============================================================
+# REACTION ROLES
+# ============================================================
+#
+#  FLUXO DE USO:
+#  1) .rr criar #canal Título da mensagem | Descrição opcional
+#       → Bot envia o embed no canal e retorna o ID da mensagem
+#
+#  2) .rr add <ID_msg> <emoji> @Cargo Descrição opcional
+#       → Adiciona a reação na mensagem e salva no banco
+#       → Pode repetir quantas vezes quiser para mais cargos
+#
+#  3) .rr lista         → Mostra todos os painéis configurados
+#     .rr info <ID_msg> → Detalha as reações de uma mensagem
+#     .rr remover <ID_msg> <emoji>   → Remove um par emoji↔cargo
+#     .rr deletar <ID_msg>           → Remove TODOS os pares da msg
+#
+# ============================================================
+
+def _rr_get(message_id: int, emoji: str):
+    """Retorna a linha do banco para (message_id, emoji), ou None."""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
+            (message_id, emoji)
+        )
+        return c.fetchone()
+
+def _rr_list_by_message(message_id: int):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT emoji, role_id, description FROM reaction_roles WHERE message_id = ?",
+            (message_id,)
+        )
+        return c.fetchall()
+
+def _rr_list_by_guild(guild_id: int):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT DISTINCT message_id, channel_id FROM reaction_roles WHERE guild_id = ?",
+            (guild_id,)
+        )
+        return c.fetchall()
+
+
+async def _rr_rebuild_embed(guild: discord.Guild, message: discord.Message):
+    """Recria o embed da mensagem de reaction roles com os pares atuais.
+    Só edita se a mensagem foi criada pelo bot (bot_message = 1)."""
+    rows = _rr_list_by_message(message.id)
+    if not rows:
+        return
+
+    # Verifica se é uma mensagem do bot (pode editar o embed)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT bot_message FROM reaction_roles WHERE message_id = ? LIMIT 1", (message.id,))
+        row = c.fetchone()
+        if not row or not row[0]:
+            return  # Mensagem de outro usuário — não edita
+
+    if message.author.id != guild.me.id:
+        return  # Proteção extra
+
+    original = message.embeds[0] if message.embeds else None
+
+    # Separa título base e corpo de opções (ignora a lista antiga se já existia)
+    if original and original.title:
+        titulo = original.title
+        # Pega só a parte antes das opções (antes do primeiro \n\n━)
+        desc_original = original.description or ""
+        if "\n\n━" in desc_original:
+            descricao = desc_original.split("\n\n━")[0]
+        else:
+            descricao = desc_original
+    else:
+        titulo    = "🎭 Escolha seu Cargo"
+        descricao = "Reaja com um emoji abaixo para receber o cargo correspondente."
+
+    # Monta as linhas de opções com separador visual
+    linhas = ["━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for emoji, role_id, desc in rows:
+        role = guild.get_role(role_id)
+        nome_cargo = role.mention if role else f"`ID {role_id}`"
+        linha = f"{emoji}  •  {nome_cargo}"
+        if desc:
+            linha += f"\n┗ *{desc}*"
+        linhas.append(linha)
+    linhas.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    embed = discord.Embed(
+        title=titulo,
+        description=descricao + "\n\n" + "\n".join(linhas),
+        color=0x5865F2
+    )
+    embed.set_footer(text=f"✅ Reaja para ganhar o cargo  •  ❌ Remova para perder")
+    await message.edit(embed=embed)
+
+
+@bot.group(name="rr", invoke_without_command=True)
+@commands.has_permissions(manage_roles=True)
+async def rr(ctx):
+    embed = discord.Embed(title="🎭 Reaction Roles — Comandos", color=0x5865F2)
+    embed.add_field(name="📋 Criar painel novo", inline=False,
+        value="`.rr criar #canal Título | Descrição`\n→ Bot cria o embed e você vincula os cargos")
+    embed.add_field(name="🔗 Vincular em msg existente", inline=False,
+        value="`.rr vincular <ID_msg> <emoji> @Cargo [desc]`\n→ Use numa mensagem **sua** já enviada")
+    embed.add_field(name="➕ Adicionar cargo (painel do bot)", inline=False,
+        value="`.rr add <ID_msg> <emoji> @Cargo [desc]`\n→ Adiciona cargo e atualiza o embed automaticamente")
+    embed.add_field(name="🗑️ Remover / Limpar", inline=False,
+        value="`.rr remover <ID> <emoji>` — Remove um par\n"
+              "`.rr deletar <ID>` — Remove todos os pares")
+    embed.add_field(name="📊 Consultar", inline=False,
+        value="`.rr lista` — Todos os painéis\n`.rr info <ID>` — Detalhes de um painel")
+    await ctx.send(embed=embed)
+
+
+@rr.command(name="criar")
+@commands.has_permissions(manage_roles=True)
+async def rr_criar(ctx, canal: discord.TextChannel, *, conteudo: str):
+    """
+    Cria o embed de reaction roles num canal.
+    Use | para separar título e descrição:
+      .rr criar #cargos 🎭 Escolha seu Cargo | Selecione abaixo!
+    """
+    if "|" in conteudo:
+        titulo, descricao = [p.strip() for p in conteudo.split("|", 1)]
+    else:
+        titulo    = conteudo.strip()
+        descricao = "Selecione um emoji abaixo para receber o cargo correspondente."
+
+    embed = discord.Embed(title=titulo, description=descricao, color=0x5865F2)
+    embed.set_footer(text="✅ Reaja para ganhar o cargo  •  ❌ Remova para perder")
+    msg = await canal.send(embed=embed)
+
+    confirm = discord.Embed(
+        title="✅ Painel criado!",
+        description=(
+            f"Canal: {canal.mention}\n"
+            f"🆔 **ID:** `{msg.id}`\n\n"
+            f"**Próximo passo:** adicione os cargos com\n"
+            f"`.rr add {msg.id} 🎮 @Cargo Descrição`\n\n"
+            f"*Repita para cada cargo que quiser adicionar.*"
+        ),
+        color=0x00ff88
+    )
+    await ctx.send(embed=confirm)
+
+
+@rr.command(name="add")
+@commands.has_permissions(manage_roles=True)
+async def rr_add(ctx, message_id: int, emoji: str, role: discord.Role, *, descricao: str = ""):
+    """
+    Adiciona um par emoji↔cargo a uma mensagem existente.
+    Exemplo: .rr add 123456789 🎮 @Jogadores Amantes de jogos
+    """
+    # Localiza a mensagem em qualquer canal do servidor
+    target_msg = None
+    for ch in ctx.guild.text_channels:
+        try:
+            target_msg = await ch.fetch_message(message_id)
+            target_channel = ch
+            break
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+    if not target_msg:
+        return await ctx.send("❌ Mensagem não encontrada. Verifique o ID.")
+
+    # Verifica se o bot consegue gerenciar esse cargo
+    if role >= ctx.guild.me.top_role:
+        return await ctx.send("❌ Esse cargo está acima do meu cargo na hierarquia.")
+
+    # Salva no banco
+    with db_connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO reaction_roles (guild_id, channel_id, message_id, emoji, role_id, description) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ctx.guild.id, target_channel.id, message_id, emoji, role.id, descricao)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return await ctx.send(f"❌ O emoji {emoji} já está configurado nessa mensagem. Use `.rr remover` primeiro.")
+
+    # Adiciona a reação na mensagem
+    try:
+        await target_msg.add_reaction(emoji)
+    except discord.HTTPException:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+            conn.commit()
+        return await ctx.send("❌ Emoji inválido ou não encontrado. Use emojis padrão ou do servidor.")
+
+    # Atualiza o embed com o novo cargo
+    await _rr_rebuild_embed(ctx.guild, target_msg)
+
+    await ctx.send(f"✅ {emoji} → {role.mention} adicionado com sucesso!", delete_after=8)
+    await ctx.message.delete(delay=8)
+
+
+@rr.command(name="vincular")
+@commands.has_permissions(manage_roles=True)
+async def rr_vincular(ctx, message_id: int, emoji: str, role: discord.Role, *, descricao: str = ""):
+    """
+    Vincula um emoji↔cargo a uma mensagem QUALQUER (inclusive mensagens suas).
+    O bot só adiciona a reação — NÃO edita o texto da mensagem.
+    Exemplo: .rr vincular 123456789 🎮 @Jogadores Amantes de jogos
+    """
+    target_msg = None
+    target_channel = None
+    for ch in ctx.guild.text_channels:
+        try:
+            target_msg = await ch.fetch_message(message_id)
+            target_channel = ch
+            break
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+    if not target_msg:
+        return await ctx.send("❌ Mensagem não encontrada. Verifique o ID e se estou no canal.")
+
+    if role >= ctx.guild.me.top_role:
+        return await ctx.send("❌ Esse cargo está acima do meu cargo na hierarquia.")
+
+    with db_connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO reaction_roles (guild_id, channel_id, message_id, emoji, role_id, description, bot_message) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",  # bot_message=0 → não edita o embed
+                (ctx.guild.id, target_channel.id, message_id, emoji, role.id, descricao)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return await ctx.send(f"❌ O emoji {emoji} já está vinculado nessa mensagem.")
+
+    try:
+        await target_msg.add_reaction(emoji)
+    except discord.HTTPException:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+            conn.commit()
+        return await ctx.send("❌ Emoji inválido. Use emojis padrão ou do servidor.")
+
+    embed = discord.Embed(
+        title="🔗 Cargo vinculado!",
+        description=(
+            f"{emoji} → {role.mention}\n"
+            f"Mensagem: [clique aqui](https://discord.com/channels/{ctx.guild.id}/{target_channel.id}/{message_id})\n"
+            + (f"Descrição: *{descricao}*" if descricao else "")
+        ),
+        color=0x00ff88
+    )
+    await ctx.send(embed=embed, delete_after=10)
+    await ctx.message.delete(delay=10)
+
+
+@commands.has_permissions(manage_roles=True)
+async def rr_remover(ctx, message_id: int, emoji: str):
+    """Remove um par emoji↔cargo de uma mensagem."""
+    row = _rr_get(message_id, emoji)
+    if not row:
+        return await ctx.send("❌ Par não encontrado para esse emoji/mensagem.")
+
+    with db_connect() as conn:
+        conn.execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+        conn.commit()
+
+    # Remove a reação da mensagem
+    for ch in ctx.guild.text_channels:
+        try:
+            msg = await ch.fetch_message(message_id)
+            await msg.clear_reaction(emoji)
+            await _rr_rebuild_embed(ctx.guild, msg)
+            break
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+    await ctx.send(f"✅ Emoji {emoji} removido do painel `{message_id}`.")
+
+
+@rr.command(name="deletar")
+@commands.has_permissions(manage_roles=True)
+async def rr_deletar(ctx, message_id: int):
+    """Remove TODOS os pares de uma mensagem e limpa as reações."""
+    rows = _rr_list_by_message(message_id)
+    if not rows:
+        return await ctx.send("❌ Nenhum cargo configurado nessa mensagem.")
+
+    with db_connect() as conn:
+        conn.execute("DELETE FROM reaction_roles WHERE message_id = ?", (message_id,))
+        conn.commit()
+
+    for ch in ctx.guild.text_channels:
+        try:
+            msg = await ch.fetch_message(message_id)
+            await msg.clear_reactions()
+            break
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+    await ctx.send(f"✅ Todos os cargos do painel `{message_id}` foram removidos.")
+
+
+@rr.command(name="lista")
+@commands.has_permissions(manage_roles=True)
+async def rr_lista(ctx):
+    """Lista todos os painéis de reaction roles do servidor."""
+    mensagens = _rr_list_by_guild(ctx.guild.id)
+    if not mensagens:
+        return await ctx.send("📭 Nenhum painel de reaction roles configurado.")
+
+    embed = discord.Embed(title="🎭 Painéis de Reaction Roles", color=0x5865F2)
+    for msg_id, ch_id in mensagens:
+        ch = ctx.guild.get_channel(ch_id)
+        rows = _rr_list_by_message(msg_id)
+        pares = ", ".join([r[0] for r in rows]) or "—"
+        embed.add_field(
+            name=f"ID: {msg_id}",
+            value=f"Canal: {ch.mention if ch else ch_id}\n"
+                  f"Emojis: {pares} ({len(rows)} cargo(s))\n"
+                  f"[Ver mensagem](https://discord.com/channels/{ctx.guild.id}/{ch_id}/{msg_id})",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+
+@rr.command(name="info")
+@commands.has_permissions(manage_roles=True)
+async def rr_info(ctx, message_id: int):
+    """Mostra todos os pares emoji↔cargo de uma mensagem."""
+    rows = _rr_list_by_message(message_id)
+    if not rows:
+        return await ctx.send("❌ Nenhum cargo configurado nessa mensagem.")
+
+    embed = discord.Embed(title=f"🎭 Pares — Painel {message_id}", color=0x5865F2)
+    for emoji, role_id, desc in rows:
+        role = ctx.guild.get_role(role_id)
+        embed.add_field(
+            name=f"{emoji} → {role.name if role else f'ID {role_id}'}",
+            value=desc or "Sem descrição",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+
+# ── Eventos de reação (coração do sistema) ───────────────────
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Atribui o cargo quando o usuário reage."""
+    if payload.user_id == bot.user.id:
+        return  # Ignora reações do próprio bot
+
+    emoji = str(payload.emoji)
+    row = _rr_get(payload.message_id, emoji)
+    if not row:
+        return  # Não é uma reaction role
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+
+    member = guild.get_member(payload.user_id)
+    if not member or member.bot:
+        return
+
+    role = guild.get_role(row[0])
+    if role:
+        try:
+            await member.add_roles(role, reason="Reaction Role")
+        except discord.Forbidden:
+            pass  # Bot sem permissão
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    """Remove o cargo quando o usuário tira a reação."""
+    if payload.user_id == bot.user.id:
+        return
+
+    emoji = str(payload.emoji)
+    row = _rr_get(payload.message_id, emoji)
+    if not row:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+
+    member = guild.get_member(payload.user_id)
+    if not member or member.bot:
+        return
+
+    role = guild.get_role(row[0])
+    if role:
+        try:
+            await member.remove_roles(role, reason="Reaction Role removido")
+        except discord.Forbidden:
+            pass
+
+# ============================================================
 # EXTRAS
 # ============================================================
 
@@ -704,6 +1109,15 @@ async def help_command(ctx):
     embed.add_field(name="ℹ️ Informações", inline=False, value=(
         "`.userinfo [@user]` — Perfil completo do membro\n"
         "`.serverinfo` — Informações do servidor"
+    ))
+    embed.add_field(name="🎭 Reaction Roles", inline=False, value=(
+        "`.rr criar #canal Título | Desc` — Criar painel (embed bonito)\n"
+        "`.rr vincular <ID> <emoji> @Cargo [desc]` — Vincular em msg sua\n"
+        "`.rr add <ID> <emoji> @Cargo [desc]` — Adicionar cargo ao painel\n"
+        "`.rr remover <ID> <emoji>` — Remover par\n"
+        "`.rr deletar <ID>` — Remover todos os pares\n"
+        "`.rr lista` — Ver todos os painéis\n"
+        "`.rr info <ID>` — Detalhar um painel"
     ))
     embed.add_field(name="⚙️ Sistemas", inline=False, value=(
         "`.setup_ticket` — Criar painel de suporte\n"
